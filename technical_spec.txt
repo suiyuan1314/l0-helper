@@ -1,0 +1,219 @@
+﻿Technical Design Document: LayerZero V2 Modular Arbitrage Bot
+Version: 2.7 (Full Implementation Specs)
+Language: Go (Golang)
+Target: EVM-compatible Chains (LayerZero V2)
+1. Executive Summary
+This document outlines the architecture for a modular, high-frequency arbitrage (HFA) bot framework. Unlike linear bots, this framework uses a "Lego Block" architecture. It defines standardized modules for Liquidity, Bridging, and Execution that can be dynamically composed to form various strategies.
+This modularity supports specific composable scenarios required for different arbitrage states:
+1. Standard Arb (Full Cycle): Buy (Chain A) $\to$ Bridge $\to$ Sell (Chain B).
+   * Use Case: Capital is in ETH/Stables; opportunity detected across chains.
+2. Inventory Arb (Half Cycle): Bridge (Chain A) $\to$ Sell (Chain B).
+   * Use Case: Bot already holds the OFT on Source; price gap opens on Destination.
+3. Rebalancing (Bridge Only): Bridge (Chain A) $\to$ Receive (Chain B).
+   * Use Case: Moving inventory to a chain with higher volume or better future opportunities.
+4. The "Closer" (Execute & Swap): Receive (Chain B) $\to$ Sell (Chain B).
+   * Use Case: Finalizing an in-flight arbitrage (decoupled from sender) or "catching" a packet after a bot restart.
+5. The "Courier" (Pure Execute): Receive (Chain B).
+   * Use Case: Claiming tokens without selling, or unblocking a stuck channel (Good Samaritan).
+6. The "Panic Sell" (Source Cleanup): Sell (Chain A).
+   * Use Case: Emergency liquidation of inventory on Source Chain if bridging fails after a buy.
+2. Modular Architecture
+The system is composed of three core "Engines" that operate independently. A central Strategy Controller chains these engines together based on the active "Recipe."
+Module
+	Role
+	Key Functionality
+	Liquidity Engine
+	Interface for DEX Aggregators
+	Queries Aggregator APIs (1inch/0x/ParaSwap) for optimal routes. Generates CallData for swaps. Checks Approvals for Aggregator Spender at Startup.
+	Bridge Engine
+	Interface for LayerZero
+	Handles lzSend (Outbound) and lzReceive (Inbound/Self-Execution).
+	Execution Engine
+	Transaction Manager
+	Submits transactions either as Atomic Bundles (Flashbots/Jito) or Sequential Transactions (Standard RPC) based on config.
+	Guard Engine
+	Risk Manager
+	Performs pre-flight checks (Nonce Gaps, Executability, Profit Thresholds).
+	3. Supported Strategies (Recipes)
+The Controller connects modules to define a "Recipe". Each step passes its output (e.g., AmountReceived) as the input to the next step.
+Recipe 1: The Standard Arb (Buy $\to$ Bridge $\to$ Sell)
+* Trigger: Price difference > (Swap Fees + Bridge Fees + Gas).
+* Source Chain Composition: Liquidity.Swap(ETH→OFT) $\to$ Bridge.Send(OFT).
+   * Execution Mode: Configurable (Bundled or Sequential).
+   * Failure Path: If Liquidity.Swap succeeds but Bridge.Send fails, immediately trigger Recipe 6.
+* Dest Chain Composition: Bridge.Receive(OFT) $\to$ Liquidity.Swap(OFT→ETH).
+* Atomicity: Dest uses Bundling if supported; otherwise Sequential (higher risk). Source relies on Recipe 6 for failure management.
+Recipe 2: The Inventory Arb (Bridge $\to$ Sell)
+* Trigger: Token Balance on Source > Threshold.
+* Source Chain Composition: Bridge.Send(OFT). (Skips Liquidity Engine).
+* Dest Chain Composition: Bridge.Receive(OFT) $\to$ Liquidity.Swap(OFT→stablecoin).
+* Advantage: Faster reaction time on Source Chain (1 fewer internal call).
+Recipe 3: Pure Bridge (Rebalance)
+* Trigger: Manual Command.
+* Source Chain Composition: Bridge.Send(OFT).
+* Dest Chain Composition: Bridge.Receive(OFT). (Skips Liquidity Engine).
+* Goal: Position assets for future Recipe 2 executions.
+Recipe 4: The "Closer" (Execute & Swap)
+* Trigger: PacketVerified event detected for our address on Destination.
+* Source Chain Composition: None (Action already occurred or handled by another bot instance).
+* Dest Chain Composition: Bridge.Receive(OFT) $\to$ Liquidity.Swap(OFT→Stable).
+   * Feature: Good Samaritan (Execute stuck Nonce N-1 if required to unblock channel, subject to Max Gap Threshold).
+* Goal: Secure profit for tokens currently "floating" in the LayerZero mempool. Essential for recovering from crashes or handling long verification delays.
+Recipe 5: The "Courier" (Pure Execute)
+* Trigger: PacketVerified event (Our Packet OR Stuck Packet).
+* Source Chain Composition: None.
+* Dest Chain Composition: Bridge.Receive(OFT).
+* Goal: 1. Self-Execution: Claim tokens to wallet without selling (HODL strategy).
+2. Good Samaritan: Execute a stuck packet (Nonce N-1) to unblock the channel for a profitable trade (Nonce N), subject to Max Gap Threshold.
+Recipe 6: The "Panic Sell" (Cleanup Mode)
+   * Trigger: Error event from Recipe 1 (Source) where Swap confirmed but Send reverted.
+   * Source Chain Composition: Liquidity.Swap(OFT→ETH).
+   * Goal: Immediate inventory liquidation. Accepts slippage/loss to prevent long-term exposure to the OFT asset. This is a high-priority, aggressive transaction.
+4. Component Details
+4.1. Liquidity Engine (Generic Swap via Aggregator)
+   * Responsibility: Fetch optimal swap routes and calldata from a DEX Aggregator (e.g., 1inch, 0x, ParaSwap, Odos) to maximize output.
+   * Inputs: TokenIn, AmountIn, TokenOut, AggregatorApiUrl.
+   * Output: * CallData (Raw bytes for the transaction).
+   * ToAddress (The Aggregator Router contract address to call).
+   * ExpectedAmountOut (for profit calculation).
+   * Operation:
+   * Quote: Calls Aggregator API (e.g., /swap/v6.0/1/swap) with slippage and disableEstimate (to save latency).
+   * Response Parsing: Extracts the data (calldata) and to fields from the JSON response.
+   * Startup Check:
+   * On initialization, queries the Aggregator API for the current Spender address (the contract that needs allowance).
+   * Checks allowance(Bot, AggregatorSpender).
+   * If allowance < Infinite, broadcasts approve(Infinite) tx and waits for confirmation before starting the trading loop.
+4.2. Bridge Engine (LayerZero V2 Adapter)
+This engine has two distinct modes: Sender and Receiver.
+Mode A: Outbound (Sender)
+Used when initiating a transfer from any chain.
+   * Fee Estimator: Calls OFT.quoteSend to calculate nativeFee.
+   * Fee Buffering: Applies a safety multiplier (e.g., 1.1x) to the returned nativeFee.
+   * Param Builder: Constructs SendParam.
+   * Configurable to Address: Can be set to the Bot's EOA (for self-execution) or a Composer Contract.
+   * Configurable Options: Builds lzReceiveOption based on the destination's gas requirements.
+Mode B: Inbound (Receiver)
+Used when listening for packets on any chain.
+   * Listener: Subscribes to PacketVerified events.
+   * Decoder: Extracts AmountSD and converts to AmountLD (Exact Amount).
+   * Self-Executor: Generates the Endpoint.lzReceive transaction payload.
+4.3. Guard Engine (Safety & Risk)
+A middleware layer that validates operations before passing them to the Execution Engine.
+   * Executability Check: Queries EndpointV2View.executable().
+   * Gap Detector (Risk #2): Checks EndpointV2.inboundNonce() vs. Packet.Nonce.
+   * Logic: If Nonce > Inbound + 1, it calculates the cost to unblock.
+   * Max Gap Threshold: A configurable integer (e.g., 3). If (Nonce - Inbound) > Threshold, the Guard Engine aborts execution.
+   * Profit Guard: Simulates the entire bundle against a local fork.
+   * Logic: Net_Balance_Change > Gas_Cost + Min_Profit.
+4.4. Execution Engine (The Executor)
+The final step. It takes a list of transactions and submits them based on the BundleMode.
+   * Input: []Transaction.
+   * Config: BundleMode (Bool: true = Atomic Bundle, false = Sequential).
+   * Mechanism:
+   * Atomic Mode: Uses Flashbots/Jito. All transactions are sent as a single bundle.
+   * Sequential Mode: Iterates through the list. Sends Tx 1, waits for confirmation (or optimistically sends Tx 2 with higher nonce).
+   * Inventory Protection:
+   * Atomic Mode: Guaranteed.
+   * Sequential Mode: Not Guaranteed. If lzReceive succeeds but Swap fails, the bot relies on subsequent retries or manual intervention.
+5. Workflow Examples
+Scenario 1: Standard Arb (Buy $\to$ Bridge $\to$ Sell)
+   1. Liquidity Engine (Source): Queries Aggregator API. Gets CallData for Swap(ETH->OFT).
+   2. Bridge Engine (Source): Estimates fees with Buffer. Generates Send(OFT->Dest) calldata.
+   3. Execution Engine (Source):
+   * Atomic: Bundles [Swap, Send].
+   * Sequential: Sends Swap. Upon receipt, sends Send. (If Send fails, triggers Recipe 6).
+   4. ...Time passes (Verification)...
+   5. Bridge Engine (Dest): Detects PacketVerified. Decodes Amount.
+   6. Liquidity Engine (Dest): Queries Aggregator API. Gets CallData for Swap(OFT->ETH) using decoded amount.
+   7. Execution Engine (Dest):
+   * Atomic: Submits Bundle [lzReceive(OFT), Swap(OFT->ETH)].
+   * Sequential: Submits lzReceive. Upon receipt, submits Swap.
+Scenario 2: Inventory Arb (Bridge $\to$ Sell)
+   1. Bridge Engine (Source): Estimates fees with Buffer. Generates Send(OFT->Dest) calldata.
+   2. Execution Engine (Source): Submits [Send]. (Approvals handled at startup).
+   3. ...Time passes (Verification)...
+   4. Bridge Engine (Dest): Detects PacketVerified. Decodes Amount.
+   5. Liquidity Engine (Dest): Queries Aggregator API. Gets CallData for Swap(OFT->ETH) using decoded amount.
+   6. Execution Engine (Dest): Submits Bundle [lzReceive(OFT), Swap(OFT->ETH)] (or Sequential).
+Scenario 3: Pure Bridge (Rebalance)
+   1. Bridge Engine (Source): Estimates fees with Buffer. Generates Send(OFT->Dest) calldata.
+   2. Execution Engine (Source): Submits [Send].
+   3. ...Time passes (Verification)...
+   4. Bridge Engine (Dest): Detects PacketVerified. Decodes Amount.
+   5. Execution Engine (Dest): Submits [lzReceive(OFT)]. (No Swap).
+Scenario 4: The "Closer" (Execute & Swap Only)
+Context: Packet is already verified (e.g., sent by a different bot instance or recovered after restart).
+   1. Bridge Engine (Dest): Detects PacketVerified event.
+   2. Guard Engine: Confirms Executable status and checks InboundNonce.
+   3. Liquidity Engine (Dest): Calculates exact AmountLD. Queries Aggregator API for Swap(OFT->Stable) calldata.
+   4. Execution Engine (Dest): Bundles [lzReceive(OFT), Swap(OFT->Stable)] (or Sequential).
+   * Outcome: Profit realized; inventory risk removed.
+Scenario 5: The "Courier" (Pure Execute Only)
+Context: Unblocking a stuck nonce ($N-1$) to allow a profitable trade ($N$).
+   1. Bridge Engine (Dest): Identifies PacketVerified for stuck nonce $N-1$ (via Scan API).
+   2. Guard Engine: Confirms Executable status and verifies Gap < Max_Gap_Threshold.
+   3. Execution Engine (Dest): Generates single tx [lzReceive(N-1)].
+   * Note: This is usually prepended to a Scenario 4 bundle if Bundling is enabled. If Sequential, it is executed first.
+6. Risk Management Matrix
+Module
+	Risk
+	Modular Mitigation
+	Bridge (Inbound)
+	Nonce Gap
+	Guard Engine calculates gap cost. If profitable AND gap <= Max Threshold, Bridge Engine generates unblocking txs (Scenario 5).
+	Liquidity
+	Slippage
+	Execution Engine enforces atomicity (if Bundling enabled). Aggregator API handles slippage calc.
+	Bridge (Outbound)
+	Fee Spikes
+	Bridge Engine adds buffer to nativeFee. If send fails, bundle reverts.
+	Source Chain
+	Broken Atomicity
+	Recipe 6 ("Panic Sell") triggers immediately if Bridge tx fails after Buy tx succeeds.
+	General
+	Race Condition
+	Execution Engine uses aggressive priority fees for the lzReceive portion of the bundle.
+	Setup
+	Missing Approval
+	Liquidity Engine queries Aggregator Spender and checks allowance at startup. Bot will not enter loop until approvals are confirmed.
+	7. Technical Implementation Specs
+The following sections define the "Hidden Logic" and external API requirements necessary to implement the engines described above.
+7.1. Protocol Specifications (Hidden Logic)
+A. OFT Packet Structure (Standard)
+The LayerZero V2 OFT Standard uses a specific payload layout that must be decoded manually to extract the exact amount.
+   * Payload Layout:
+   * Offset 0-31: Receiver Address (bytes32).
+   * Offset 32-39: AmountSD (uint64).
+   * Decoding Logic:
+   1. Extract bytes [32:40].
+   2. Convert bytes to BigInt.
+   3. Apply Decimal Conversion Formula (see below).
+B. Decimal Conversion Formula
+OFTs normalize amounts to Shared Decimals (SD) over the wire and convert back to Local Decimals (LD) on the destination.
+   * Formula: AmountLD = AmountSD * 10^(LocalDecimals - SharedDecimals)
+   * Constants:
+   * SharedDecimals = 6 (Verify by reading oft.sharedDecimals() on-chain).
+   * LocalDecimals = 18 (Verify via oft.decimals()).
+C. Options Encoding (Type 3)
+To construct extraOptions for the SendParam struct, strictly follow the Options Type 3 standard.
+   * Structure: TYPE_3 (0x0003) + WORKER_ID (0x01) + OPTION_LENGTH + OPTION_TYPE + PARAMS.
+   * Example (lzReceiveOption):
+   * Option Type: 1
+   * Params: gasLimit (uint128) + msgValue (uint128).
+   * Instruction: Use the official OptionsBuilder logic or a bitwise builder to append ExecutorLzReceiveOption.
+7.2. LayerZero Scan API (For Good Samaritan Mode)
+Required for Recipe 5 (Unblocking Stuck Nonces) to fetch the payload of packets the bot did not send itself.
+   * Base URL (Mainnet): https://scan.layerzero.network/api (Verify specific V2 endpoint).
+   * Target Endpoint: GET /messages?srcEid={id}&dstEid={id}&nonce={nonce}
+   * Required Response Fields:
+   * guid: The Global Unique Identifier of the stuck message.
+   * message: The raw hex payload (needed to reconstruct the lzReceive call).
+   * options: The execution options used (needed to estimate gas).
+7.3. Execution State Enums
+Used to map the integer response from EndpointV2View.executable.
+   * 0: NotExecutable (Do not send; wait for DVN verification).
+   * 1: Executable (Ready to send; proceed to Execution Engine).
+   * 2: Executed (Already processed; abort).
+7.4. Infrastructure Credentials
+   * Flashbots Relay: https://relay.flashbots.net (for Ethereum Mainnet).
+   * Private Key: Must be loaded via Environment Variable (e.g., ETH_PRIVATE_KEY), never hardcoded in source.
