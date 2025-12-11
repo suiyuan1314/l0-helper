@@ -23,5 +23,8 @@ echo "Generating EndpointV2View bindings..."
 abigen --abi abis/EndpointV2View.json --pkg endpointv2view --type EndpointV2View --out contracts/endpointv2view/endpointv2view.go
 
 # Generate bindings for IOFT
+# Generate bindings for IOFT
 echo "Generating IOFT bindings..."
+abigen --abi abis/IOFT.json --pkg ioft --type IOFT --out contracts/ioft/ioft.go
+
 echo "Bindings generated successfully!"
