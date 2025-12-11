@@ -3,24 +3,22 @@ package bridge
 import (
 	"context"
 	"crypto/ecdsa"
-	"encoding/json"
 	"fmt"
-	"io"
 	"math/big"
-	"os"
 
-	"github.com/ethereum/go-ethereum"
-	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/l0-modular-arb-bot/config"
 	"github.com/l0-modular-arb-bot/contracts"
+	"github.com/l0-modular-arb-bot/contracts/endpointv2"
+	"github.com/l0-modular-arb-bot/contracts/ioft"
 )
 
 // Engine represents the Bridge Engine for LayerZero V2 operations
 type Engine struct {
-	Config     *config.Config
+	Config *config.Config
 }
 
 // NewEngine creates a new Bridge Engine instance
@@ -44,12 +42,12 @@ type SendResult struct {
 
 // SendParams represents parameters for sending a LayerZero message
 type SendParams struct {
-	ChainName       string
-	From            common.Address
-	ToAddress       common.Address
-	Amount          *big.Int
-	DstEID          uint32
-	FeeBuffer       float64
+	ChainName string
+	From      common.Address
+	ToAddress common.Address
+	Amount    *big.Int
+	DstEID    uint32
+	FeeBuffer float64
 }
 
 // Send sends a LayerZero message from the source chain
@@ -60,70 +58,65 @@ func (e *Engine) Send(ctx context.Context, client *contracts.Client, params Send
 		return nil, fmt.Errorf("chain %s not found in config", params.ChainName)
 	}
 
-	// Convert receiver address to bytes32
+	oftAddr := common.HexToAddress(chainConfig.Contracts.OFT)
+	ioftInstance, err := ioft.NewIOFT(oftAddr, client.ETHClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create IOFT binding: %w", err)
+	}
+
 	receiverBytes32 := common.BytesToHash(params.ToAddress.Bytes())
 
-	// Call quoteSend to estimate fees
-	quoteArgs := []interface{}{
-		params.DstEID,
-		receiverBytes32,
-		params.Amount,
-		false,
-		[]byte{}, // options
+	// Build SendParam
+	sendParam := ioft.SendParam{
+		DstEid:       params.DstEID,
+		To:           receiverBytes32,
+		AmountLD:     params.Amount,
+		MinAmountLD:  params.Amount,            // Assuming 100% fixed for now, practically should imply slippage
+		ExtraOptions: e.buildLzReceiveOption(), // Using legacy function for now, simpler
+		ComposeMsg:   []byte{},
+		OftCmd:       []byte{},
 	}
 
-	quoteResult, err := client.CallContract(ctx, common.HexToAddress(chainConfig.Contracts.OFT), client.OFTABI, "quoteSend", quoteArgs...)
+	// Quote Send
+	// quoteSend(SendParam calldata _sendParam, bool _payInLzToken) external view returns (MessagingFee memory msgFee);
+	msgFee, err := ioftInstance.QuoteSend(&bind.CallOpts{Context: ctx}, sendParam, false)
 	if err != nil {
-		return nil, fmt.Errorf("failed to call quoteSend: %w", err)
+		return nil, fmt.Errorf("failed to quote send: %w", err)
 	}
 
-	// Parse quote result
-	if len(quoteResult) != 1 {
-		return nil, fmt.Errorf("invalid quoteSend result length: %d", len(quoteResult))
+	// Apply fee buffer to NativeFee
+	nativeFee := msgFee.NativeFee
+	if params.FeeBuffer > 0 {
+		bufferMult := big.NewInt(int64((1.0 + params.FeeBuffer) * 100))
+		nativeFee = new(big.Int).Mul(nativeFee, bufferMult)
+		nativeFee = nativeFee.Div(nativeFee, big.NewInt(100))
+	}
+	msgFee.NativeFee = nativeFee
+
+	// Prepare transaction options
+	chainID, err := client.ETHClient.ChainID(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get chain ID: %w", err)
 	}
 
-	nativeFee, ok := quoteResult[0].(*big.Int)
-	if !ok {
-		return nil, fmt.Errorf("failed to parse nativeFee from quoteSend")
+	auth, err := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create transactor: %w", err)
 	}
+	auth.Value = nativeFee // CRITICAL FIX: Send native fee with transaction
+	auth.Context = ctx
 
-	// Apply fee buffer
-	feeWithBuffer := new(big.Int).Mul(nativeFee, big.NewInt(int64(params.FeeBuffer*1000000000)))
-	feeWithBuffer = feeWithBuffer.Div(feeWithBuffer, big.NewInt(1000000000))
-
-	// Build SendParam struct
-	sendParam := struct {
-		dstEid     uint32
-		receiver   common.Address
-		amount     *big.Int
-		minAmount  *big.Int
-		lzReceiveOption []byte
-		extraOptions     []byte
-		composer        common.Address
-	}{}
-
-	// Set SendParam fields
-	sendParam.dstEid = params.DstEID
-	sendParam.receiver = params.ToAddress
-	sendParam.amount = params.Amount
-	sendParam.minAmount = params.Amount // Assuming full amount is expected
-	sendParam.lzReceiveOption = e.buildLzReceiveOption()
-	sendParam.extraOptions = []byte{}
-	sendParam.composer = common.Address{}
-
-	// Pack SendParam into bytes directly in SendTransaction call
-
-	// Send transaction
-	tx, err := client.SendTransaction(ctx, common.HexToAddress(chainConfig.Contracts.OFT), client.OFTABI, params.From, privateKey, "send", sendParam)
+	// Send Transaction
+	// send(SendParam calldata _sendParam, MessagingFee calldata _fee, address _refundAddress) external payable returns (MessagingReceipt memory msgReceipt, OFTReceipt memory oftReceipt);
+	tx, err := ioftInstance.Send(auth, sendParam, msgFee, params.From)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send transaction: %w", err)
 	}
 
-	// Return result
 	return &SendResult{
 		Transaction: tx,
-		GUID:        common.Hash{}, // TODO: Extract GUID from event
-		Nonce:       0,              // TODO: Extract nonce from event
+		GUID:        common.Hash{}, // TODO: Parse logs to get GUID if strictly needed immediately, or wait for event
+		Nonce:       0,
 	}, nil
 }
 
@@ -135,19 +128,12 @@ type ReceiveResult struct {
 
 // ReceiveParams represents parameters for receiving a LayerZero message
 type ReceiveParams struct {
-	ChainName       string
-	From            common.Address
-	Origin          Origin
-	GUID            common.Hash
-	Message         []byte
-	ExtraData       []byte
-}
-
-// Origin represents the origin of a LayerZero message
-type Origin struct {
-	SrcEid  uint32
-	Sender  common.Hash
-	Nonce   uint64
+	ChainName string
+	From      common.Address
+	Origin    endpointv2.Origin
+	GUID      common.Hash
+	Message   []byte
+	ExtraData []byte
 }
 
 // Receive processes a LayerZero message on the destination chain
@@ -158,16 +144,25 @@ func (e *Engine) Receive(ctx context.Context, client *contracts.Client, params R
 		return nil, fmt.Errorf("chain %s not found in config", params.ChainName)
 	}
 
-	// No need to build data explicitly - SendTransaction will handle packing
+	endpointAddr := common.HexToAddress(chainConfig.Contracts.Endpoint)
+	endpoint, err := endpointv2.NewEndpointV2(endpointAddr, client.ETHClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Endpoint binding: %w", err)
+	}
 
-	// Send transaction
-	tx, err := client.SendTransaction(ctx, common.HexToAddress(chainConfig.Contracts.Endpoint), client.EndpointV2ABI, params.From, privateKey, "lzReceive", 
-		params.Origin,
-		params.From, // receiver
-		params.GUID,
-		params.Message,
-		params.ExtraData,
-	)
+	// Prepare auth
+	chainID, err := client.ETHClient.ChainID(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get chain ID: %w", err)
+	}
+	auth, err := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create transactor: %w", err)
+	}
+	auth.Context = ctx
+
+	// lzReceive(Origin calldata _origin, address _receiver, bytes32 _guid, bytes calldata _message, bytes calldata _extraData) external payable;
+	tx, err := endpoint.LzReceive(auth, params.Origin, params.From, params.GUID, params.Message, params.ExtraData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send lzReceive transaction: %w", err)
 	}
@@ -240,16 +235,16 @@ func (e *Engine) buildLzReceiveOption() []byte {
 
 // MonitorPacketVerified monitors PacketVerified events on a chain
 type MonitorPacketVerifiedParams struct {
-	ChainName   string
-	Client      *ethclient.Client
-	Handler     func(event PacketVerifiedEvent)
+	ChainName string
+	Client    *ethclient.Client
+	Handler   func(event PacketVerifiedEvent)
 }
 
 // PacketVerifiedEvent represents a PacketVerified event
 type PacketVerifiedEvent struct {
-	Origin   Origin
-	Receiver common.Address
-	GUID     common.Hash
+	Origin      endpointv2.Origin
+	Receiver    common.Address
+	PayloadHash [32]byte
 }
 
 // MonitorPacketVerified monitors PacketVerified events on a chain
@@ -260,91 +255,31 @@ func (e *Engine) MonitorPacketVerified(ctx context.Context, params MonitorPacket
 		return fmt.Errorf("chain %s not found in config", params.ChainName)
 	}
 
-	// Load EndpointV2 ABI
-	endpointV2ABI, err := loadEndpointV2ABI()
+	endpointAddr := common.HexToAddress(chainConfig.Contracts.Endpoint)
+	filterer, err := endpointv2.NewEndpointV2Filterer(endpointAddr, params.Client)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create endpoint filterer: %w", err)
 	}
 
-	// Get event ID for PacketVerified
-	eventID := endpointV2ABI.Events["PacketVerified"].ID
-
-	// Create event filter query using ethereum.FilterQuery
-	query := ethereum.FilterQuery{
-		Addresses: []common.Address{common.HexToAddress(chainConfig.Contracts.Endpoint)},
-		Topics:    [][]common.Hash{{eventID}},
-	}
-
-	// Create event channel
-	events := make(chan types.Log)
-	sub, err := params.Client.SubscribeFilterLogs(ctx, query, events)
+	sink := make(chan *endpointv2.EndpointV2PacketVerified)
+	sub, err := filterer.WatchPacketVerified(&bind.WatchOpts{Context: ctx}, sink)
 	if err != nil {
-		return fmt.Errorf("failed to subscribe to PacketVerified events: %w", err)
+		return fmt.Errorf("failed to watch PacketVerified events: %w", err)
 	}
 	defer sub.Unsubscribe()
 
-	// Process events
 	for {
 		select {
 		case err := <-sub.Err():
 			return fmt.Errorf("subscription error: %w", err)
-		case vLog := <-events:
-			// Parse the event
-			event, err := e.parsePacketVerifiedEvent(endpointV2ABI, vLog)
-			if err != nil {
-				fmt.Printf("failed to parse PacketVerified event: %v\n", err)
-				continue
-			}
-
-			// Call the handler
-			params.Handler(event)
+		case event := <-sink:
+			params.Handler(PacketVerifiedEvent{
+				Origin:      event.Origin,
+				Receiver:    event.Receiver,
+				PayloadHash: event.PayloadHash,
+			})
 		case <-ctx.Done():
 			return nil
 		}
 	}
-}
-
-// parsePacketVerifiedEvent parses a PacketVerified event from a log
-func (e *Engine) parsePacketVerifiedEvent(endpointV2ABI abi.ABI, vLog types.Log) (PacketVerifiedEvent, error) {
-	var event PacketVerifiedEvent
-
-	// Unpack the event data
-	err := endpointV2ABI.UnpackIntoInterface(&event, "PacketVerified", vLog.Data)
-	if err != nil {
-		return event, fmt.Errorf("failed to unpack PacketVerified event: %w", err)
-	}
-
-	// Extract topics (Origin struct)
-	if len(vLog.Topics) < 4 {
-		return event, fmt.Errorf("invalid PacketVerified event topic count: %d", len(vLog.Topics))
-	}
-
-	// Parse Origin struct from topics
-	event.Origin.SrcEid = uint32(new(big.Int).SetBytes(vLog.Topics[1].Bytes()).Uint64())
-	event.Origin.Sender = vLog.Topics[2]
-	event.Origin.Nonce = new(big.Int).SetBytes(vLog.Topics[3].Bytes()).Uint64()
-	event.GUID = vLog.Topics[0]
-
-	return event, nil
-}
-
-// loadEndpointV2ABI loads the EndpointV2 ABI from file
-func loadEndpointV2ABI() (abi.ABI, error) {
-	file, err := os.Open("abis/EndpointV2.json")
-	if err != nil {
-		return abi.ABI{}, fmt.Errorf("failed to open EndpointV2 ABI file: %w", err)
-	}
-	defer file.Close()
-
-	content, err := io.ReadAll(file)
-	if err != nil {
-		return abi.ABI{}, fmt.Errorf("failed to read EndpointV2 ABI file: %w", err)
-	}
-
-	var endpointV2ABI abi.ABI
-	if err := json.Unmarshal(content, &endpointV2ABI); err != nil {
-		return abi.ABI{}, fmt.Errorf("failed to unmarshal EndpointV2 ABI: %w", err)
-	}
-
-	return endpointV2ABI, nil
 }

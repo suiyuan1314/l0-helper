@@ -1,23 +1,24 @@
 package liquidity
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/big"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/l0-modular-arb-bot/config"
+	"github.com/l0-modular-arb-bot/contracts/erc20"
 )
 
 // Engine represents the Liquidity Engine for DEX interactions
@@ -36,29 +37,60 @@ func NewEngine(params NewEngineParams) (*Engine, error) {
 	return &Engine{
 		Config: params.Config,
 		HTTPClient: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout: 20 * time.Second, // Increased timeout for 2-step process
 		},
 	}, nil
 }
 
 // SwapQuote represents a swap quote from the DEX aggregator
 type SwapQuote struct {
-	ToAddress     common.Address
-	CallData      []byte
-	ExpectedOut   *big.Int
-	Gas           uint64
+	ToAddress   common.Address
+	CallData    []byte
+	ExpectedOut *big.Int
+	Gas         uint64
 }
 
-// GetSwapQuote fetches a swap quote from the DEX aggregator
+// GetSwapQuoteParams represents parameters for fetching a swap quote
 type GetSwapQuoteParams struct {
-	ChainName     string
-	TokenIn       common.Address
-	TokenOut      common.Address
-	AmountIn      *big.Int
-	Slippage      float64
+	ChainName string
+	TokenIn   common.Address
+	TokenOut  common.Address
+	AmountIn  *big.Int
+	Slippage  float64
+	Sender    common.Address // Added sender for KyberSwap
+	Recipient common.Address // Added recipient for KyberSwap
 }
 
-// GetSwapQuote fetches a swap quote from the DEX aggregator
+// KyberSwap V1 API Structs
+
+type kyberGetRouteResponse struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    struct {
+		RouteSummary  json.RawMessage `json:"routeSummary"` // Keep raw for passing to build
+		RouterAddress string          `json:"routerAddress"`
+	} `json:"data"`
+}
+
+type kyberBuildRouteRequest struct {
+	RouteSummary json.RawMessage `json:"routeSummary"`
+	Sender       string          `json:"sender"`
+	Recipient    string          `json:"recipient"`
+	Slippage     float64         `json:"slippageTolerance"`
+}
+
+type kyberBuildRouteResponse struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    struct {
+		AmountOut     string `json:"amountOut"`
+		Gas           string `json:"gas"`
+		Data          string `json:"data"`
+		RouterAddress string `json:"routerAddress"`
+	} `json:"data"`
+}
+
+// GetSwapQuote fetches a swap quote from KyberSwap V1 API
 func (e *Engine) GetSwapQuote(ctx context.Context, params GetSwapQuoteParams) (*SwapQuote, error) {
 	// Get chain configuration
 	chainConfig := e.Config.GetChainConfig(params.ChainName)
@@ -66,103 +98,143 @@ func (e *Engine) GetSwapQuote(ctx context.Context, params GetSwapQuoteParams) (*
 		return nil, fmt.Errorf("chain %s not found in config", params.ChainName)
 	}
 
-	// Prepare request to DEX aggregator
-	url, err := e.buildSwapURL(chainConfig, params)
+	// 1. Get Route (GET /routes)
+	routeURL, err := e.buildRouteURL(chainConfig, params)
 	if err != nil {
 		return nil, err
 	}
 
-	// Make request
-	resp, err := e.HTTPClient.Get(url.String())
+	req, err := http.NewRequestWithContext(ctx, "GET", routeURL.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get swap quote: %w", err)
+		return nil, fmt.Errorf("failed to create route request: %w", err)
+	}
+	req.Header.Set("x-client-id", "L0ModularArbBot")
+
+	resp, err := e.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get swap route: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Read response
-	body, err := ioutil.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("get routes failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var routeResp kyberGetRouteResponse
+	if err := json.NewDecoder(resp.Body).Decode(&routeResp); err != nil {
+		return nil, fmt.Errorf("failed to decode route response: %w", err)
+	}
+
+	if routeResp.Code != 0 && routeResp.Code != 200 { // KyberSwap might use 0 or 200 for success
+		return nil, fmt.Errorf("kyberswap route error: %s", routeResp.Message)
+	}
+
+	// 2. Build Route (POST /route/build)
+	buildURL, err := e.buildBuildURL(chainConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return nil, err
 	}
 
-	// Parse response
-	var quoteResp aggregatorResponse
-	if err := json.Unmarshal(body, &quoteResp); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+	// Prepare build request body
+	buildReqBody := kyberBuildRouteRequest{
+		RouteSummary: routeResp.Data.RouteSummary,
+		Sender:       params.Sender.Hex(),
+		Recipient:    params.Recipient.Hex(),
+		Slippage:     params.Slippage * 100, // KyberSwap uses bps (10 = 0.1%), input is usually percentage (0.5 for 0.5%)?
+		// Wait, doc says: "The value is in ranges [0, 2000], with 10 meaning 0.1%, and 0.1 meaning 0.001%."
+		// If params.Slippage is e.g. 0.5 (meaning 0.5%), then 0.5% = 50 bps.
+		// If params.Slippage is 0.005 (meaning 0.5%), then 0.5% = 50 bps.
+		// Let's assume params.Slippage is stored as percentage float (e.g. 0.5 for 0.5%).
+		// So 0.5 * 100 = 50 bps.
+	}
+	// Correcting slippage calculation based on doc: "The unit is bps (1/100 of 1%). ... 10 meaning 0.1%"
+	// So 1 bps = 0.01%. 10 bps = 0.1%.
+	// If params.Slippage is 0.5 (percent), we need 50.
+	// So params.Slippage * 100 seems correct if params.Slippage is the number (0.5) and not fraction (0.005).
+	// Assuming params.Slippage is like 0.5 for 0.5%.
+
+	buildBody, err := json.Marshal(buildReqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal build request: %w", err)
 	}
 
-	// Convert to SwapQuote
-	return e.parseSwapQuote(quoteResp)
+	reqBuild, err := http.NewRequestWithContext(ctx, "POST", buildURL.String(), bytes.NewBuffer(buildBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create build request: %w", err)
+	}
+	reqBuild.Header.Set("Content-Type", "application/json")
+	reqBuild.Header.Set("x-client-id", "L0ModularArbBot")
+
+	respBuild, err := e.HTTPClient.Do(reqBuild)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build swap route: %w", err)
+	}
+	defer respBuild.Body.Close()
+
+	if respBuild.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(respBuild.Body)
+		return nil, fmt.Errorf("build route failed with status %d: %s", respBuild.StatusCode, string(body))
+	}
+
+	var buildResp kyberBuildRouteResponse
+	if err := json.NewDecoder(respBuild.Body).Decode(&buildResp); err != nil {
+		return nil, fmt.Errorf("failed to decode build response: %w", err)
+	}
+
+	if buildResp.Code != 0 && buildResp.Code != 200 {
+		return nil, fmt.Errorf("kyberswap build error: %s", buildResp.Message)
+	}
+
+	return e.parseKyberSwapQuote(buildResp)
 }
 
 // CheckApproval checks if the bot has sufficient approval for the aggregator spender
 type CheckApprovalParams struct {
-	ChainName     string
-	TokenAddress  common.Address
+	ChainName      string
+	TokenAddress   common.Address
 	SpenderAddress common.Address
-	OwnerAddress  common.Address
-	Client        *ethclient.Client
+	OwnerAddress   common.Address
+	RequiredAmount *big.Int
+	Client         *ethclient.Client
 }
 
 // CheckApproval checks if the bot has sufficient approval for the aggregator spender
 func (e *Engine) CheckApproval(ctx context.Context, params CheckApprovalParams) (bool, error) {
-	// Get chain configuration
-	chainConfig := e.Config.GetChainConfig(params.ChainName)
-	if chainConfig == nil {
-		return false, fmt.Errorf("chain %s not found in config", params.ChainName)
-	}
-
-	// Load ERC20 ABI
-	erc20ABI, err := loadERC20ABI()
+	erc20Instance, err := erc20.NewERC20(params.TokenAddress, params.Client)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("failed to create ERC20 binding: %w", err)
 	}
 
 	// Call allowance method
-	data, err := erc20ABI.Pack("allowance", params.OwnerAddress, params.SpenderAddress)
-	if err != nil {
-		return false, fmt.Errorf("failed to pack allowance method: %w", err)
-	}
-
-	// Use direct RPC call to eth_call
-	callArgs := map[string]interface{}{
-		"to":   params.TokenAddress,
-		"data": data,
-	}
-
-	var result []byte
-	err = params.Client.Client().CallContext(ctx, &result, "eth_call", callArgs, "latest")
+	allowance, err := erc20Instance.Allowance(&bind.CallOpts{Context: ctx}, params.OwnerAddress, params.SpenderAddress)
 	if err != nil {
 		return false, fmt.Errorf("failed to call allowance: %w", err)
 	}
 
-	// Unpack result
-	var allowance *big.Int
-	if err := erc20ABI.UnpackIntoInterface(&allowance, "allowance", result); err != nil {
-		return false, fmt.Errorf("failed to unpack allowance: %w", err)
-	}
-
-	// Check if allowance is sufficient (infinite approval is typically a very large number)
-	return allowance.Cmp(big.NewInt(0)) > 0 && allowance.Cmp(big.NewInt(1000000000000000000)) > 0, nil
+	// Check if allowance is sufficient
+	return allowance.Cmp(params.RequiredAmount) >= 0, nil
 }
 
 // Approve generates an approve transaction for the aggregator spender
 type ApproveParams struct {
-	ChainName     string
-	TokenAddress  common.Address
+	ChainName      string
+	TokenAddress   common.Address
 	SpenderAddress common.Address
 }
 
 // Approve generates an approve transaction for the aggregator spender
 func (e *Engine) Approve(ctx context.Context, params ApproveParams) ([]byte, common.Address, error) {
-	// Load ERC20 ABI
-	erc20ABI, err := loadERC20ABI()
+	// Get ABI
+	erc20ABI, err := erc20.ERC20MetaData.GetAbi()
 	if err != nil {
-		return nil, common.Address{}, err
+		return nil, common.Address{}, fmt.Errorf("failed to get ERC20 ABI: %w", err)
 	}
 
 	// Generate approve call data with infinite approval
-	data, err := erc20ABI.Pack("approve", params.SpenderAddress, big.NewInt(0).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1)))
+	// MaxUint256
+	maxUint256 := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+	data, err := erc20ABI.Pack("approve", params.SpenderAddress, maxUint256)
 	if err != nil {
 		return nil, common.Address{}, fmt.Errorf("failed to pack approve method: %w", err)
 	}
@@ -170,51 +242,69 @@ func (e *Engine) Approve(ctx context.Context, params ApproveParams) ([]byte, com
 	return data, params.TokenAddress, nil
 }
 
-// buildSwapURL builds the URL for the DEX aggregator API call
-func (e *Engine) buildSwapURL(chainConfig *config.ChainConfig, params GetSwapQuoteParams) (*url.URL, error) {
+// buildRouteURL builds the URL for the KyberSwap GET /routes API call
+func (e *Engine) buildRouteURL(chainConfig *config.ChainConfig, params GetSwapQuoteParams) (*url.URL, error) {
+	// Parse base URL (should be like https://aggregator-api.kyberswap.com/chain/api)
+	// We want https://aggregator-api.kyberswap.com/chain/api/v1/routes
+	baseURL, err := url.Parse(chainConfig.Aggregator.ApiUrl)
+	if err != nil {
+		return nil, fmt.Errorf("invalid aggregator API URL: %w", err)
+	}
+
+	// Append /v1/routes
+	// Ensure no double slashes
+	baseURL.Path = strings.TrimSuffix(baseURL.Path, "/") + "/v1/routes"
+
+	// Add query parameters
+	q := baseURL.Query()
+	q.Set("tokenIn", params.TokenIn.Hex())
+	q.Set("tokenOut", params.TokenOut.Hex())
+	q.Set("amountIn", params.AmountIn.String())
+	// Note: slippage is not needed for GET route in V1 unless filtering,
+	// but the doc says "find best route". It doesn't list slippage as required for GET.
+	// It is required for POST.
+
+	// q.Set("gasInclude", "true") // Defaults to true
+
+	baseURL.RawQuery = q.Encode()
+
+	return baseURL, nil
+}
+
+// buildBuildURL builds the URL for the KyberSwap POST /route/build API call
+func (e *Engine) buildBuildURL(chainConfig *config.ChainConfig) (*url.URL, error) {
 	// Parse base URL
 	baseURL, err := url.Parse(chainConfig.Aggregator.ApiUrl)
 	if err != nil {
 		return nil, fmt.Errorf("invalid aggregator API URL: %w", err)
 	}
 
-	// Set path for swap endpoint
-	baseURL.Path = strings.TrimSuffix(baseURL.Path, "/") + "/swap"
-
-	// Add query parameters
-	q := baseURL.Query()
-	q.Set("fromTokenAddress", params.TokenIn.Hex())
-	q.Set("toTokenAddress", params.TokenOut.Hex())
-	q.Set("amount", params.AmountIn.String())
-	q.Set("slippage", fmt.Sprintf("%f", params.Slippage))
-	q.Set("disableEstimate", "true")
-	if chainConfig.Aggregator.ApiKey != "" {
-		q.Set("apiKey", chainConfig.Aggregator.ApiKey)
-	}
-	baseURL.RawQuery = q.Encode()
-
+	// Append /v1/route/build
+	baseURL.Path = strings.TrimSuffix(baseURL.Path, "/") + "/v1/route/build"
 	return baseURL, nil
 }
 
-// parseSwapQuote parses the aggregator response into a SwapQuote
-func (e *Engine) parseSwapQuote(resp aggregatorResponse) (*SwapQuote, error) {
+// parseKyberSwapQuote parses the KyberSwap build response into a SwapQuote
+func (e *Engine) parseKyberSwapQuote(resp kyberBuildRouteResponse) (*SwapQuote, error) {
 	// Extract relevant information from the response
-	toAddress := common.HexToAddress(resp.Tx.To)
-	callData, err := hex.DecodeString(strings.TrimPrefix(resp.Tx.Data, "0x"))
+	toAddress := common.HexToAddress(resp.Data.RouterAddress)
+
+	callData, err := hex.DecodeString(strings.TrimPrefix(resp.Data.Data, "0x"))
 	if err != nil {
 		return nil, fmt.Errorf("invalid call data: %w", err)
 	}
 
 	// Parse expected output amount
-	expectedOut, ok := new(big.Int).SetString(resp.ToAmount, 10)
+	expectedOut, ok := new(big.Int).SetString(resp.Data.AmountOut, 10)
 	if !ok {
-		return nil, fmt.Errorf("invalid expected output amount: %s", resp.ToAmount)
+		return nil, fmt.Errorf("invalid expected output amount: %s", resp.Data.AmountOut)
 	}
 
 	// Parse gas estimate
-	gas, err := strconv.ParseUint(resp.Tx.Gas, 10, 64)
+	gas, err := strconv.ParseUint(resp.Data.Gas, 10, 64)
 	if err != nil {
-		return nil, fmt.Errorf("invalid gas estimate: %w", err)
+		// Log warning?
+		gas = 500000 // default or 0
 	}
 
 	return &SwapQuote{
@@ -223,35 +313,4 @@ func (e *Engine) parseSwapQuote(resp aggregatorResponse) (*SwapQuote, error) {
 		ExpectedOut: expectedOut,
 		Gas:         gas,
 	}, nil
-}
-
-// aggregatorResponse represents the response from the DEX aggregator
-type aggregatorResponse struct {
-	ToAmount string `json:"toAmount"`
-	Tx       struct {
-		To    string `json:"to"`
-		Data  string `json:"data"`
-		Gas   string `json:"gas"`
-	} `json:"tx"`
-}
-
-// loadERC20ABI loads the ERC20 ABI from file
-func loadERC20ABI() (abi.ABI, error) {
-	file, err := os.Open("abis/ERC20.json")
-	if err != nil {
-		return abi.ABI{}, fmt.Errorf("failed to open ERC20 ABI file: %w", err)
-	}
-	defer file.Close()
-
-	content, err := ioutil.ReadAll(file)
-	if err != nil {
-		return abi.ABI{}, fmt.Errorf("failed to read ERC20 ABI file: %w", err)
-	}
-
-	var erc20ABI abi.ABI
-	if err := json.Unmarshal(content, &erc20ABI); err != nil {
-		return abi.ABI{}, fmt.Errorf("failed to unmarshal ERC20 ABI: %w", err)
-	}
-
-	return erc20ABI, nil
 }

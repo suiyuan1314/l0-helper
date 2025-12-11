@@ -6,14 +6,17 @@ import (
 	"math/big"
 	"strconv"
 
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/l0-modular-arb-bot/config"
 	"github.com/l0-modular-arb-bot/contracts"
+	"github.com/l0-modular-arb-bot/contracts/endpointv2"
+	"github.com/l0-modular-arb-bot/contracts/endpointv2view"
 )
 
 // Engine represents the Guard Engine for risk validation
 type Engine struct {
-	Config     *config.Config
+	Config *config.Config
 }
 
 // NewEngine creates a new Guard Engine instance
@@ -30,17 +33,10 @@ func NewEngine(params NewEngineParams) (*Engine, error) {
 
 // CheckExecutabilityParams represents parameters for checking executability
 type CheckExecutabilityParams struct {
-	ChainName   string
-	Origin      Origin
-	Receiver    common.Address
-	Client      *contracts.Client
-}
-
-// Origin represents the origin of a LayerZero message
-type Origin struct {
-	SrcEid  uint32
-	Sender  common.Hash
-	Nonce   uint64
+	ChainName string
+	Origin    endpointv2view.Origin
+	Receiver  common.Address
+	Client    *contracts.Client
 }
 
 // ExecutabilityStatus represents the executability status of a message
@@ -70,27 +66,16 @@ func (e *Engine) CheckExecutability(ctx context.Context, params CheckExecutabili
 		return nil, fmt.Errorf("EndpointView contract not configured for chain %s", params.ChainName)
 	}
 
-	// Call EndpointV2View.executable()
-	args := []interface{}{
-		params.Origin.SrcEid,
-		params.Origin.Sender,
-		params.Origin.Nonce,
-		params.Receiver,
+	endpointViewAddr := common.HexToAddress(chainConfig.Contracts.EndpointView)
+	endpointView, err := endpointv2view.NewEndpointV2View(endpointViewAddr, params.Client.ETHClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create EndpointV2View binding: %w", err)
 	}
 
-	result, err := params.Client.CallContract(ctx, common.HexToAddress(chainConfig.Contracts.EndpointView), params.Client.EndpointV2ViewABI, "executable", args...)
+	// Call EndpointV2View.executable()
+	status, err := endpointView.Executable(&bind.CallOpts{Context: ctx}, params.Origin, params.Receiver)
 	if err != nil {
 		return nil, fmt.Errorf("failed to call executable: %w", err)
-	}
-
-	// Parse result
-	if len(result) != 1 {
-		return nil, fmt.Errorf("invalid executable result length: %d", len(result))
-	}
-
-	status, ok := result[0].(uint8)
-	if !ok {
-		return nil, fmt.Errorf("failed to parse executability status")
 	}
 
 	return &CheckExecutabilityResult{
@@ -100,17 +85,17 @@ func (e *Engine) CheckExecutability(ctx context.Context, params CheckExecutabili
 
 // CheckNonceGapParams represents parameters for checking nonce gaps
 type CheckNonceGapParams struct {
-	ChainName   string
-	Origin      Origin
-	Receiver    common.Address
-	Client      *contracts.Client
+	ChainName string
+	Origin    endpointv2.Origin
+	Receiver  common.Address
+	Client    *contracts.Client
 }
 
 // CheckNonceGapResult represents the result of a nonce gap check
 type CheckNonceGapResult struct {
-	Gap          uint64
-	Cost         *big.Int
-	CanUnblock   bool
+	Gap        uint64
+	Cost       *big.Int
+	CanUnblock bool
 }
 
 // CheckNonceGap checks for nonce gaps and calculates the cost to unblock
@@ -121,40 +106,35 @@ func (e *Engine) CheckNonceGap(ctx context.Context, params CheckNonceGapParams) 
 		return nil, fmt.Errorf("chain %s not found in config", params.ChainName)
 	}
 
-	// Get current inbound nonce
-	args := []interface{}{
-		params.Receiver,
-		params.Origin.SrcEid,
-		params.Origin.Sender,
+	endpointAddr := common.HexToAddress(chainConfig.Contracts.Endpoint)
+	endpoint, err := endpointv2.NewEndpointV2(endpointAddr, params.Client.ETHClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Endpoint binding: %w", err)
 	}
 
-	result, err := params.Client.CallContract(ctx, common.HexToAddress(chainConfig.Contracts.Endpoint), params.Client.EndpointV2ABI, "inboundNonce", args...)
+	// Get current inbound nonce
+	currentNonce, err := endpoint.InboundNonce(&bind.CallOpts{Context: ctx}, params.Receiver, params.Origin.SrcEid, params.Origin.Sender)
 	if err != nil {
 		return nil, fmt.Errorf("failed to call inboundNonce: %w", err)
 	}
 
-	// Parse result
-	if len(result) != 1 {
-		return nil, fmt.Errorf("invalid inboundNonce result length: %d", len(result))
-	}
-
-	currentNonce, ok := result[0].(uint64)
-	if !ok {
-		return nil, fmt.Errorf("failed to parse inboundNonce")
-	}
-
 	// Calculate gap
-	gap := params.Origin.Nonce - currentNonce
+	gap := uint64(0)
+	if params.Origin.Nonce > currentNonce {
+		gap = params.Origin.Nonce - currentNonce - 1 // Gap is nonce - current - 1, since current is strictly last executed.
+		// Wait, inboundNonce usually returns the last executed one.
+		// If last executed is 5, and we are sending 7, gap is 1 (nonce 6 is missing).
+		// If we are sending 6, gap is 0.
+	}
 
 	// Check if gap is within threshold
-	canUnblock := gap <= e.Config.Bot.MaxGapThreshold && gap > 0
+	canUnblock := gap > 0 && gap <= e.Config.Bot.MaxGapThreshold
 
 	// Calculate cost to unblock (simplified implementation)
-	// In a real implementation, this would estimate the gas cost for each unblocking transaction
 	cost := big.NewInt(0)
 	if canUnblock {
 		// Estimate gas cost per lzReceive transaction
-		gasPerTx := big.NewInt(500000) // 500k gas per tx
+		gasPerTx := big.NewInt(500000)      // 500k gas per tx
 		gasPrice := big.NewInt(10000000000) // 10 gwei
 		costPerTx := new(big.Int).Mul(gasPerTx, gasPrice)
 		cost = new(big.Int).Mul(costPerTx, big.NewInt(int64(gap)))
@@ -169,10 +149,10 @@ func (e *Engine) CheckNonceGap(ctx context.Context, params CheckNonceGapParams) 
 
 // CheckProfitParams represents parameters for checking profit
 type CheckProfitParams struct {
-	ExpectedOut   *big.Int
-	GasCost       *big.Int
-	BridgeCost    *big.Int
-	MinProfit     *big.Int
+	ExpectedOut *big.Int
+	GasCost     *big.Int
+	BridgeCost  *big.Int
+	MinProfit   *big.Int
 }
 
 // CheckProfitResult represents the result of a profit check
@@ -200,17 +180,17 @@ func (e *Engine) CheckProfit(params CheckProfitParams) (*CheckProfitResult, erro
 
 // SimulateProfitParams represents parameters for simulating profit
 type SimulateProfitParams struct {
-	ChainName   string
-	From        common.Address
+	ChainName    string
+	From         common.Address
 	Transactions []Transaction
-	Client      *contracts.Client
+	Client       *contracts.Client
 }
 
 // Transaction represents a transaction to be simulated
 type Transaction struct {
-	To           common.Address
-	Data         []byte
-	Value        *big.Int
+	To    common.Address
+	Data  []byte
+	Value *big.Int
 }
 
 // SimulateProfitResult represents the result of a profit simulation
@@ -236,7 +216,7 @@ func (e *Engine) SimulateProfit(ctx context.Context, params SimulateProfitParams
 
 	// For now, we'll use a simplified approach
 	gasCost := big.NewInt(1000000000000000000) // 1 ETH gas cost
-	profit := big.NewInt(50000000000000000) // 0.05 ETH profit
+	profit := big.NewInt(50000000000000000)    // 0.05 ETH profit
 	isProfitable := profit.Cmp(big.NewInt(0)) > 0
 
 	return &SimulateProfitResult{
@@ -248,12 +228,12 @@ func (e *Engine) SimulateProfit(ctx context.Context, params SimulateProfitParams
 
 // ValidateTransactionParams represents parameters for validating a transaction
 type ValidateTransactionParams struct {
-	ChainName   string
-	From        common.Address
-	To          common.Address
-	Data        []byte
-	Value       *big.Int
-	Client      *contracts.Client
+	ChainName string
+	From      common.Address
+	To        common.Address
+	Data      []byte
+	Value     *big.Int
+	Client    *contracts.Client
 }
 
 // ValidateTransactionResult represents the result of a transaction validation
@@ -266,9 +246,9 @@ type ValidateTransactionResult struct {
 func (e *Engine) ValidateTransaction(ctx context.Context, params ValidateTransactionParams) (*ValidateTransactionResult, error) {
 	// Estimate gas using direct RPC call
 	gasEstimateArgs := map[string]interface{}{
-		"from": params.From,
-		"to":   params.To,
-		"data": params.Data,
+		"from":  params.From,
+		"to":    params.To,
+		"data":  params.Data,
 		"value": params.Value,
 	}
 
@@ -301,9 +281,9 @@ func (e *Engine) ValidateTransaction(ctx context.Context, params ValidateTransac
 
 	// Check if transaction would fail (simulate it with eth_call)
 	callArgs := map[string]interface{}{
-		"from": params.From,
-		"to":   params.To,
-		"data": params.Data,
+		"from":  params.From,
+		"to":    params.To,
+		"data":  params.Data,
 		"value": params.Value,
 	}
 

@@ -8,9 +8,12 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/l0-modular-arb-bot/bridge"
 	"github.com/l0-modular-arb-bot/config"
 	"github.com/l0-modular-arb-bot/contracts"
+	"github.com/l0-modular-arb-bot/contracts/endpointv2"
+	"github.com/l0-modular-arb-bot/contracts/endpointv2view"
 	"github.com/l0-modular-arb-bot/execution"
 	"github.com/l0-modular-arb-bot/guard"
 	"github.com/l0-modular-arb-bot/liquidity"
@@ -64,21 +67,21 @@ type Recipe struct {
 
 // ExecuteRecipeParams represents parameters for executing a recipe
 type ExecuteRecipeParams struct {
-	Recipe       Recipe
-	ChainName    string
-	From         common.Address
-	PrivateKey   *ecdsa.PrivateKey
-	Amount       *big.Int
-	Client       *contracts.Client
+	Recipe           Recipe
+	ChainName        string // Source chain for Standard/Inventory/Rebalancing, Dest for Closer/Panic
+	From             common.Address
+	PrivateKey       *ecdsa.PrivateKey
+	Amount           *big.Int
+	Client           *contracts.Client
 	DestinationChain string
-	DestEID      uint32
-	ToAddress    common.Address
+	DestEID          uint32
+	ToAddress        common.Address
 }
 
 // ExecuteRecipeResult represents the result of executing a recipe
 type ExecuteRecipeResult struct {
-	Success bool
-	Message string
+	Success      bool
+	Message      string
 	Transactions []*types.Transaction
 }
 
@@ -116,6 +119,8 @@ func (c *Controller) executeStandardArb(ctx context.Context, params ExecuteRecip
 		TokenOut:  common.HexToAddress(chainConfig.Contracts.OFT),
 		AmountIn:  params.Amount,
 		Slippage:  0.005, // 0.5%
+		Sender:    params.From,
+		Recipient: params.From,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get swap quote: %w", err)
@@ -123,12 +128,12 @@ func (c *Controller) executeStandardArb(ctx context.Context, params ExecuteRecip
 
 	// Step 2: Send LayerZero message via Bridge Engine
 	sendResult, err := c.BridgeEngine.Send(ctx, params.Client, bridge.SendParams{
-		ChainName:   params.ChainName,
-		From:        params.From,
-		ToAddress:   params.ToAddress,
-		Amount:      swapQuote.ExpectedOut,
-		DstEID:      params.DestEID,
-		FeeBuffer:   c.Config.Bot.FeeBufferMultiplier,
+		ChainName: params.ChainName,
+		From:      params.From,
+		ToAddress: params.ToAddress,
+		Amount:    swapQuote.ExpectedOut,
+		DstEID:    params.DestEID,
+		FeeBuffer: c.Config.Bot.FeeBufferMultiplier,
 	}, params.PrivateKey)
 	if err != nil {
 		// If bridge fails, trigger Panic Sell
@@ -146,8 +151,8 @@ func (c *Controller) executeStandardArb(ctx context.Context, params ExecuteRecip
 	// This would typically be handled by a separate listener goroutine
 	// For simplicity, we'll return after sending the bridge message
 	return &ExecuteRecipeResult{
-		Success: true,
-		Message: "Standard Arb executed successfully",
+		Success:      true,
+		Message:      "Standard Arb executed successfully",
 		Transactions: []*types.Transaction{sendResult.Transaction},
 	}, nil
 }
@@ -156,20 +161,20 @@ func (c *Controller) executeStandardArb(ctx context.Context, params ExecuteRecip
 func (c *Controller) executeInventoryArb(ctx context.Context, params ExecuteRecipeParams) (*ExecuteRecipeResult, error) {
 	// Step 1: Send LayerZero message via Bridge Engine
 	sendResult, err := c.BridgeEngine.Send(ctx, params.Client, bridge.SendParams{
-		ChainName:   params.ChainName,
-		From:        params.From,
-		ToAddress:   params.ToAddress,
-		Amount:      params.Amount,
-		DstEID:      params.DestEID,
-		FeeBuffer:   c.Config.Bot.FeeBufferMultiplier,
+		ChainName: params.ChainName,
+		From:      params.From,
+		ToAddress: params.ToAddress,
+		Amount:    params.Amount,
+		DstEID:    params.DestEID,
+		FeeBuffer: c.Config.Bot.FeeBufferMultiplier,
 	}, params.PrivateKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send bridge message: %w", err)
 	}
 
 	return &ExecuteRecipeResult{
-		Success: true,
-		Message: "Inventory Arb executed successfully",
+		Success:      true,
+		Message:      "Inventory Arb executed successfully",
 		Transactions: []*types.Transaction{sendResult.Transaction},
 	}, nil
 }
@@ -178,44 +183,46 @@ func (c *Controller) executeInventoryArb(ctx context.Context, params ExecuteReci
 func (c *Controller) executeRebalancing(ctx context.Context, params ExecuteRecipeParams) (*ExecuteRecipeResult, error) {
 	// Step 1: Send LayerZero message via Bridge Engine
 	sendResult, err := c.BridgeEngine.Send(ctx, params.Client, bridge.SendParams{
-		ChainName:   params.ChainName,
-		From:        params.From,
-		ToAddress:   params.ToAddress,
-		Amount:      params.Amount,
-		DstEID:      params.DestEID,
-		FeeBuffer:   c.Config.Bot.FeeBufferMultiplier,
+		ChainName: params.ChainName,
+		From:      params.From,
+		ToAddress: params.ToAddress,
+		Amount:    params.Amount,
+		DstEID:    params.DestEID,
+		FeeBuffer: c.Config.Bot.FeeBufferMultiplier,
 	}, params.PrivateKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send bridge message: %w", err)
 	}
 
 	return &ExecuteRecipeResult{
-		Success: true,
-		Message: "Rebalancing executed successfully",
+		Success:      true,
+		Message:      "Rebalancing executed successfully",
 		Transactions: []*types.Transaction{sendResult.Transaction},
 	}, nil
 }
 
 // executeTheCloser executes The Closer recipe: Execute & Swap
 type TheCloserParams struct {
-	ChainName   string
-	From        common.Address
-	PrivateKey  *ecdsa.PrivateKey
-	Origin      bridge.Origin
-	Client      *contracts.Client
-	TokenIn     common.Address
-	TokenOut    common.Address
+	ChainName  string
+	From       common.Address
+	PrivateKey *ecdsa.PrivateKey
+	Origin     endpointv2.Origin
+	Client     *contracts.Client
+	TokenIn    common.Address
+	TokenOut   common.Address
 }
 
 // executeTheCloser executes The Closer recipe: Execute & Swap
 func (c *Controller) executeTheCloser(ctx context.Context, params ExecuteRecipeParams) (*ExecuteRecipeResult, error) {
 	// Step 1: Check if message is executable
+	// NOTE: CheckExecutability requires endpointv2view.Origin (View contract struct)
+	// We need to convert or construct correctly.
+
 	executabilityResult, err := c.GuardEngine.CheckExecutability(ctx, guard.CheckExecutabilityParams{
 		ChainName: params.ChainName,
-		Origin: guard.Origin{
+		Origin: endpointv2view.Origin{
 			SrcEid: params.DestEID,
-			// Sender and Nonce would come from PacketVerified event
-			Sender: common.Hash{},
+			Sender: [32]byte{}, // Placeholder
 			Nonce:  0,
 		},
 		Receiver: params.From,
@@ -235,9 +242,9 @@ func (c *Controller) executeTheCloser(ctx context.Context, params ExecuteRecipeP
 	// Step 2: Check for nonce gaps
 	nonceGapResult, err := c.GuardEngine.CheckNonceGap(ctx, guard.CheckNonceGapParams{
 		ChainName: params.ChainName,
-		Origin: guard.Origin{
+		Origin: endpointv2.Origin{
 			SrcEid: params.DestEID,
-			Sender: common.Hash{},
+			Sender: [32]byte{},
 			Nonce:  0,
 		},
 		Receiver: params.From,
@@ -259,53 +266,66 @@ func (c *Controller) executeTheCloser(ctx context.Context, params ExecuteRecipeP
 	}
 
 	// Step 3: Get swap quote for destination chain
-	// Get OFT address from configuration for destination chain
-	destChainConfig := c.Config.GetChainConfig(params.DestinationChain)
+	destChainConfig := c.Config.GetChainConfig(params.ChainName)
 	if destChainConfig == nil {
-		return nil, fmt.Errorf("destination chain %s not found in config", params.DestinationChain)
+		return nil, fmt.Errorf("destination chain %s not found in config", params.ChainName)
 	}
 	swapQuote, err := c.LiquidityEngine.GetSwapQuote(ctx, liquidity.GetSwapQuoteParams{
-		ChainName: params.DestinationChain,
+		ChainName: params.ChainName,
 		TokenIn:   common.HexToAddress(destChainConfig.Contracts.OFT),
 		TokenOut:  common.HexToAddress("0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"), // ETH
 		AmountIn:  params.Amount,
 		Slippage:  0.005, // 0.5%
+		Sender:    params.From,
+		Recipient: params.From,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get swap quote: %w", err)
 	}
 
-	// Step 4: Build transactions
-	transactions := []execution.Transaction{
-		{
-			// lzReceive transaction
-			To:   common.HexToAddress(c.Config.GetChainConfig(params.ChainName).Contracts.Endpoint),
-			Data: []byte{}, // This would be built by Bridge Engine
-			Value: big.NewInt(0),
-		},
-		{
-			// Swap transaction
-			To:   swapQuote.ToAddress,
-			Data: swapQuote.CallData,
-			Value: big.NewInt(0),
-		},
+	// Step 4: Check Approval
+	approveTx, err := c.ensureApproval(ctx, params.ChainName, common.HexToAddress(destChainConfig.Contracts.OFT), swapQuote.ToAddress, params.Amount, params.From, params.Client.ETHClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to ensure approval: %w", err)
 	}
 
-	// Step 5: Execute transactions
+	// Step 5: Build transactions
+	var transactions []execution.Transaction
+
+	// LZ Receive
+	transactions = append(transactions, execution.Transaction{
+		To:    common.HexToAddress(c.Config.GetChainConfig(params.ChainName).Contracts.Endpoint),
+		Data:  []byte{},
+		Value: big.NewInt(0),
+	})
+
+	// Add approve if needed
+	if approveTx != nil {
+		transactions = append(transactions, *approveTx)
+	}
+
+	// Swap transaction
+	transactions = append(transactions, execution.Transaction{
+		To:    swapQuote.ToAddress,
+		Data:  swapQuote.CallData,
+		Value: big.NewInt(0),
+	})
+
+	// Step 6: Execute transactions
 	executeResult, err := c.ExecutionEngine.Execute(ctx, execution.ExecuteParams{
-		ChainName:   params.ChainName,
-		From:        params.From,
-		PrivateKey:  params.PrivateKey,
+		ChainName:    params.ChainName,
+		From:         params.From,
+		PrivateKey:   params.PrivateKey,
 		Transactions: transactions,
-		Client:      params.Client,
+		Client:       params.Client,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute transactions: %w", err)
 	}
 
 	return &ExecuteRecipeResult{
-		Success: true,
-		Message: "The Closer executed successfully",
+		Success:      true,
+		Message:      "The Closer executed successfully",
 		Transactions: executeResult.Transactions,
 	}, nil
 }
@@ -315,27 +335,27 @@ func (c *Controller) executeTheCourier(ctx context.Context, params ExecuteRecipe
 	// Step 1: Build lzReceive transaction
 	transactions := []execution.Transaction{
 		{
-			To:   common.HexToAddress(c.Config.GetChainConfig(params.ChainName).Contracts.Endpoint),
-			Data: []byte{}, // This would be built by Bridge Engine
+			To:    common.HexToAddress(c.Config.GetChainConfig(params.ChainName).Contracts.Endpoint),
+			Data:  []byte{},
 			Value: big.NewInt(0),
 		},
 	}
 
 	// Step 2: Execute transaction
 	executeResult, err := c.ExecutionEngine.Execute(ctx, execution.ExecuteParams{
-		ChainName:   params.ChainName,
-		From:        params.From,
-		PrivateKey:  params.PrivateKey,
+		ChainName:    params.ChainName,
+		From:         params.From,
+		PrivateKey:   params.PrivateKey,
 		Transactions: transactions,
-		Client:      params.Client,
+		Client:       params.Client,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute transaction: %w", err)
 	}
 
 	return &ExecuteRecipeResult{
-		Success: true,
-		Message: "The Courier executed successfully",
+		Success:      true,
+		Message:      "The Courier executed successfully",
 		Transactions: executeResult.Transactions,
 	}, nil
 }
@@ -354,22 +374,33 @@ func (c *Controller) executePanicSell(ctx context.Context, params ExecuteRecipeP
 		TokenOut:  common.HexToAddress("0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"), // ETH
 		AmountIn:  params.Amount,
 		Slippage:  0.01, // 1% (more aggressive for panic sell)
+		Sender:    params.From,
+		Recipient: params.From,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get swap quote: %w", err)
 	}
 
-	// Step 2: Build swap transaction
-	transactions := []execution.Transaction{
-		{
-			To:   swapQuote.ToAddress,
-			Data: swapQuote.CallData,
-			Value: big.NewInt(0),
-		},
+	// Step 2: Ensure Approval
+	approveTx, err := c.ensureApproval(ctx, params.ChainName, common.HexToAddress(chainConfig.Contracts.OFT), swapQuote.ToAddress, params.Amount, params.From, params.Client.ETHClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to ensure approval: %w", err)
 	}
 
-	// Step 3: Execute transaction with high priority
-	// Set high priority fee for panic sell
+	// Step 3: Build swap transaction
+	var transactions []execution.Transaction
+	if approveTx != nil {
+		transactions = append(transactions, *approveTx)
+	}
+
+	tx := execution.Transaction{
+		To:    swapQuote.ToAddress,
+		Data:  swapQuote.CallData,
+		Value: big.NewInt(0),
+	}
+	transactions = append(transactions, tx)
+
+	// Step 4: Execute transaction with high priority
 	baseFee, priorityFee, err := c.ExecutionEngine.GetSuggestedGasFees(ctx, params.Client.ETHClient)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get gas fees: %w", err)
@@ -378,34 +409,36 @@ func (c *Controller) executePanicSell(ctx context.Context, params ExecuteRecipeP
 	// Increase priority fee by 5x for panic sell
 	highPriorityFee := new(big.Int).Mul(priorityFee, big.NewInt(5))
 
-	// Update transaction gas fees
-	transactions[0].PriorityFee = highPriorityFee
-	transactions[0].MaxFeePerGas = new(big.Int).Add(baseFee, highPriorityFee)
+	// Update all transactions gas fees
+	for i := range transactions {
+		transactions[i].PriorityFee = highPriorityFee
+		transactions[i].MaxFeePerGas = new(big.Int).Add(baseFee, highPriorityFee)
+	}
 
-	// Step 4: Execute transaction
+	// Step 5: Execute transaction
 	executeResult, err := c.ExecutionEngine.Execute(ctx, execution.ExecuteParams{
-		ChainName:   params.ChainName,
-		From:        params.From,
-		PrivateKey:  params.PrivateKey,
+		ChainName:    params.ChainName,
+		From:         params.From,
+		PrivateKey:   params.PrivateKey,
 		Transactions: transactions,
-		Client:      params.Client,
+		Client:       params.Client,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute panic sell: %w", err)
 	}
 
 	return &ExecuteRecipeResult{
-		Success: true,
-		Message: "Panic Sell executed successfully",
+		Success:      true,
+		Message:      "Panic Sell executed successfully",
 		Transactions: executeResult.Transactions,
 	}, nil
 }
 
 // MonitorPackets monitors PacketVerified events and triggers appropriate recipes
 type MonitorPacketsParams struct {
-	ChainName   string
-	Client      *contracts.Client
-	Handler     func(recipe Recipe, event bridge.PacketVerifiedEvent)
+	ChainName string
+	Client    *contracts.Client
+	Handler   func(recipe Recipe, event bridge.PacketVerifiedEvent)
 }
 
 // MonitorPackets monitors PacketVerified events and triggers appropriate recipes
@@ -426,4 +459,40 @@ func (c *Controller) MonitorPackets(ctx context.Context, params MonitorPacketsPa
 			params.Handler(recipe, event)
 		},
 	})
+}
+
+// ensureApproval checks and generates approval transaction if needed
+func (c *Controller) ensureApproval(ctx context.Context, chainName string, token common.Address, spender common.Address, amount *big.Int, owner common.Address, client *ethclient.Client) (*execution.Transaction, error) {
+	// Check approval
+	approved, err := c.LiquidityEngine.CheckApproval(ctx, liquidity.CheckApprovalParams{
+		ChainName:      chainName,
+		TokenAddress:   token,
+		SpenderAddress: spender,
+		OwnerAddress:   owner,
+		RequiredAmount: amount,
+		Client:         client,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to check approval: %w", err)
+	}
+
+	if approved {
+		return nil, nil // No approval needed
+	}
+
+	// Generate approval
+	data, to, err := c.LiquidityEngine.Approve(ctx, liquidity.ApproveParams{
+		ChainName:      chainName,
+		TokenAddress:   token,
+		SpenderAddress: spender,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate approval: %w", err)
+	}
+
+	return &execution.Transaction{
+		To:    to,
+		Data:  data,
+		Value: big.NewInt(0),
+	}, nil
 }
