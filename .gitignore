@@ -38,4 +38,5 @@ build/
 
 # Temporary files
 *.tmp
-*.temp
+*.tempconfig.json
+config.json
